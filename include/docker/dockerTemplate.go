@@ -2,9 +2,11 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 
 	"github.com/bruhugo/PicoClawProjectRuntime/include/blobstorage"
 	"github.com/bruhugo/PicoClawProjectRuntime/include/config"
@@ -14,25 +16,18 @@ import (
 	"github.com/moby/moby/client"
 )
 
-type Container struct {
-	ID      string                   `json:"id"`
-	AgentID string                   `json:"agent_id"`
-	UserID  string                   `json:"user_id"`
-	State   container.ContainerState `json:"state"`
-}
-
 type DockerTemplate interface {
 	Start(ctx context.Context) error
 	Close()
 
 	PullPicoclawImage(ctx context.Context) error
 
-	CreateAgentContainer(ctx context.Context, agent *types.Agent) (*Container, error)
-	StartAgentContainer(ctx context.Context, agent *types.Agent, container *Container) error
+	CreateAgentContainer(ctx context.Context, agent *types.Agent) (*types.Container, error)
+	StartAgentContainer(ctx context.Context, agent *types.Agent, container *types.Container) error
 
-	FindByUserID(ctx context.Context, userId string) ([]*Container, error)
-	FindByAgentID(ctx context.Context, containerId string) (*Container, error)
-	FindAll(ctx context.Context) ([]*Container, error)
+	FindByUserID(ctx context.Context, userId string) ([]*types.Container, error)
+	FindByAgentID(ctx context.Context, containerId string) (*types.Container, error)
+	FindAll(ctx context.Context) ([]*types.Container, error)
 
 	GetAgentStats(ctx context.Context) ([]types.AgentStats, error)
 }
@@ -61,6 +56,10 @@ func (t *DockerTemplateImpl) Start(ctx context.Context) error {
 
 	t.client = client
 
+	if err = CreateStateFile(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -88,7 +87,7 @@ func (t *DockerTemplateImpl) PullPicoclawImage(ctx context.Context) error {
 	return nil
 }
 
-func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *types.Agent) (*Container, error) {
+func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *types.Agent) (*types.Container, error) {
 	slog.Debug("creating container",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
@@ -109,8 +108,22 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 
 	labels := make(map[string]string)
 	labels["userId"] = agent.UserID
+	labels["agentId"] = agent.ID
 
-	t.blobstorage.LoadWorkspace(ctx, agent)
+	err = t.blobstorage.LoadWorkspace(ctx, agent)
+	if err != nil {
+		return nil, fmt.Errorf("error loading remote workspace: %w", err)
+	}
+
+	err = os.MkdirAll(agent.GetHostLogsPath(), 0755)
+	if err != nil {
+		return nil, fmt.Errorf("error creating logs dir: %w", err)
+	}
+
+	_, err = os.OpenFile(agent.GetHostConfigPath(), os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("error creating config file: %w", err)
+	}
 
 	createOptions := client.ContainerCreateOptions{
 		Image: config.AppConfig.PicoclawImage,
@@ -147,20 +160,29 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 		return nil, fmt.Errorf("error creating container %s: %w", agent.ID, err)
 	}
 
+	c := &types.Container{
+		ID:      created.ID,
+		AgentID: agent.ID,
+		UserID:  agent.UserID,
+		State:   "created",
+	}
+
+	if err = AddAgentToState(agent, c); err != nil {
+		slog.Error("error adding agent to state file",
+			slog.String("agentID", agent.ID),
+			slog.Any("error", err),
+		)
+	}
+
 	slog.Debug("container created",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
 	)
 
-	return &Container{
-		ID:      created.ID,
-		AgentID: agent.ID,
-		UserID:  agent.UserID,
-		State:   "created",
-	}, nil
+	return c, nil
 }
 
-func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *types.Agent, container *Container) error {
+func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *types.Agent, container *types.Container) error {
 	slog.Debug("starting container",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
@@ -178,12 +200,13 @@ func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *typ
 	return nil
 }
 
-func (t *DockerTemplateImpl) FindByUserID(ctx context.Context, userID string) ([]*Container, error) {
+func (t *DockerTemplateImpl) FindByUserID(ctx context.Context, userID string) ([]*types.Container, error) {
 	filters := make(client.Filters)
 	filters.Add("label", "userId="+userID)
 
 	options := client.ContainerListOptions{
 		Filters: filters,
+		All:     true,
 	}
 
 	res, err := t.client.ContainerList(ctx, options)
@@ -191,12 +214,12 @@ func (t *DockerTemplateImpl) FindByUserID(ctx context.Context, userID string) ([
 		return nil, fmt.Errorf("error listing all containers: %w", err)
 	}
 
-	containers := make([]*Container, 0)
+	containers := make([]*types.Container, 0)
 	for _, item := range res.Items {
-		containers = append(containers, &Container{
+		containers = append(containers, &types.Container{
 			ID:      item.ID,
 			UserID:  item.Labels["userId"],
-			AgentID: item.Labels["name"],
+			AgentID: item.Labels["agentId"],
 			State:   item.State,
 		})
 	}
@@ -204,12 +227,12 @@ func (t *DockerTemplateImpl) FindByUserID(ctx context.Context, userID string) ([
 	return containers, nil
 }
 
-func (t *DockerTemplateImpl) FindByAgentID(ctx context.Context, agentID string) (*Container, error) {
+func (t *DockerTemplateImpl) FindByAgentID(ctx context.Context, agentID string) (*types.Container, error) {
 	filters := make(client.Filters)
-	filters.Add("name", agentID)
+	filters.Add("label", "agentId="+agentID)
 	listOptions := client.ContainerListOptions{
 		Filters: filters,
-		All:     false,
+		All:     true,
 	}
 
 	res, err := t.client.ContainerList(ctx, listOptions)
@@ -221,27 +244,26 @@ func (t *DockerTemplateImpl) FindByAgentID(ctx context.Context, agentID string) 
 		return nil, nil
 	}
 
-	container := &Container{
-		ID:      res.Items[0].ID,
-		AgentID: agentID,
-		UserID:  res.Items[0].Labels["userId"],
-		State:   res.Items[0].State,
-	}
-
-	return container, nil
+	item := res.Items[0]
+	return &types.Container{
+		ID:      item.ID,
+		AgentID: item.Labels["agentId"],
+		UserID:  item.Labels["userId"],
+		State:   item.State,
+	}, nil
 }
 
-func (t *DockerTemplateImpl) FindAll(ctx context.Context) ([]*Container, error) {
+func (t *DockerTemplateImpl) FindAll(ctx context.Context) ([]*types.Container, error) {
 	res, err := t.client.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return nil, fmt.Errorf("error listing all containers: %w", err)
 	}
 
-	containers := make([]*Container, 0)
+	containers := make([]*types.Container, 0)
 	for _, item := range res.Items {
-		containers = append(containers, &Container{
+		containers = append(containers, &types.Container{
 			ID:      item.ID,
-			AgentID: item.Labels["name"],
+			AgentID: item.Labels["agentId"],
 			UserID:  item.Labels["userId"],
 			State:   item.State,
 		})
@@ -251,5 +273,39 @@ func (t *DockerTemplateImpl) FindAll(ctx context.Context) ([]*Container, error) 
 }
 
 func (t *DockerTemplateImpl) GetAgentStats(ctx context.Context) ([]types.AgentStats, error) {
-	return nil, nil
+	states, err := ReadStateFile()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read from state file: %w", err)
+	}
+
+	agentStats := make([]types.AgentStats, 0)
+	for _, state := range states {
+		res, err := t.client.ContainerStats(ctx, state.Container.ID, client.ContainerStatsOptions{})
+		if err != nil {
+			slog.Error("error getting container stats", slog.String("agentID", state.Agent.ID), slog.Any("error", err))
+			continue
+		}
+
+		var stats container.StatsResponse
+		err = json.NewDecoder(res.Body).Decode(&stats)
+		res.Body.Close()
+		if err != nil {
+			slog.Error("error parsing stats response", slog.String("agentID", state.Agent.ID), slog.Any("error", err))
+			continue
+		}
+
+		agentStats = append(agentStats, types.AgentStats{
+			AgentID: state.Agent.ID,
+			CpuUsage: types.CpuUsage{
+				CpuLimit: state.Agent.Tier.Limits.Cpu,
+				CpuUsed:  CalculateCpuUsed(&stats),
+			},
+			MemoryUsage: types.MemoryUsage{
+				MemoryLimitMb: state.Agent.Tier.Limits.MemoryMb,
+				MemoryUsedMb:  CalculateMemoryUsed(&stats),
+			},
+		})
+	}
+
+	return agentStats, nil
 }

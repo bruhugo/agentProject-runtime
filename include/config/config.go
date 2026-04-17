@@ -10,7 +10,7 @@ type Config struct {
 	RedisPassword string `env:"REDIS_PASSWORD" json:"redis_password"`
 
 	S3AccessKeyID     string `env:"AWS_ACCESS_KEY_ID,required"`
-	S3SecretAccessKey string `env:"AWS_SECRET_ACCESS_KEY,required"`
+	S3SecretAccessKey string `env:"AWS_SECRET_KEY,required"`
 	S3Region          string `env:"AWS_REGION,required"`
 	S3Bucket          string `env:"S3_BUCKET,required"`
 
@@ -18,7 +18,8 @@ type Config struct {
 
 	PicoclawImage string `env:"PICOCLAW_IMAGE" json:"picoclaw_image"`
 
-	SystemUser string `env:"SYSTEM_USER"`
+	SystemUser string `env:"USER"`
+	LogLevel   string `env:"LOG_LEVEL"`
 }
 
 var AppConfig Config

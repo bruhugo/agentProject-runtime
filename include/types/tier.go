@@ -19,11 +19,11 @@ type Features struct {
 }
 
 type Limits struct {
-	Cpu         float32 `json:"cpu"`
-	MemoryMb    uint32  `json:"memory_mb"`
-	WorkspaceMb uint32  `json:"workspace_mb"`
-	StateMb     uint32  `json:"state_mb"`
-	LogsMb      uint32  `json:"logs_mb"`
+	Cpu         float64 `json:"cpu"`
+	MemoryMb    uint64  `json:"memory_mb"`
+	WorkspaceMb uint64  `json:"workspace_mb"`
+	StateMb     uint64  `json:"state_mb"`
+	LogsMb      uint64  `json:"logs_mb"`
 	MaxAgents   uint32  `json:"max_agents"`
 	MaxSkills   uint32  `json:"max_skills"`
 }

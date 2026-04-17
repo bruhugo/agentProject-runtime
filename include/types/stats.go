@@ -1,19 +1,23 @@
 package types
 
+type CpuUsage struct {
+	CpuUsed  float64 `json:"cpu_used"`
+	CpuLimit float64 `json:"cpu_available"`
+}
+
+type MemoryUsage struct {
+	MemoryUsedMb  uint64 `json:"memory_used_mb"`
+	MemoryLimitMb uint64 `json:"memory_available_mb"`
+}
+
 type AgentStats struct {
-	ID           string
-	UserID       string
-	State        State
-	MemoryMb     int
-	Cpu          int
-	UsedMemoryMb int
-	UsedCpu      int
+	AgentID     string
+	MemoryUsage MemoryUsage `json:"memory_usage"`
+	CpuUsage    CpuUsage    `json:"cpu_usage"`
 }
 
 type VpsStats struct {
-	MemoryMb     int
-	Cpu          int
-	UsedMemoryMb int
-	UsedCpu      int
-	AgentStatus  []AgentStats
+	MemoryUsage MemoryUsage  `json:"memory_usage"`
+	CpuUsage    CpuUsage     `json:"cpu_usage"`
+	Agents      []AgentStats `json:"agents"`
 }

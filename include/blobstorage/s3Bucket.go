@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -47,7 +48,7 @@ func (bucket *S3Bucket) Start(ctx context.Context) error {
 	return nil
 }
 
-func (bucket *S3Bucket) GetFile(ctx context.Context, filepath, remotepath string) error {
+func (bucket *S3Bucket) GetFile(ctx context.Context, path, remotepath string) error {
 	getObjectInput := &s3.GetObjectInput{
 		Bucket: &config.AppConfig.S3Bucket,
 		Key:    &remotepath,
@@ -58,10 +59,14 @@ func (bucket *S3Bucket) GetFile(ctx context.Context, filepath, remotepath string
 		return fmt.Errorf("error retrieving object %s: %w", remotepath, err)
 	}
 
-	file, err := os.OpenFile(filepath, os.O_CREATE|os.O_WRONLY, 0)
-	if err != nil {
-		return fmt.Errorf("error to open/create file %s: %w", filepath, err)
+	if err = os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("error creating directories for file %s: %s", path, err)
 	}
+	file, err := os.OpenFile(filepath.Dir(path), os.O_CREATE|os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("error to open/create file %s: %w", path, err)
+	}
+	defer file.Close()
 
 	_, err = io.Copy(file, out.Body)
 	if err != nil {
@@ -72,28 +77,31 @@ func (bucket *S3Bucket) GetFile(ctx context.Context, filepath, remotepath string
 }
 
 func (bucket *S3Bucket) GetDir(ctx context.Context, dirpath, remotepath string) error {
-	_, err := os.Stat(dirpath)
-	if os.IsNotExist(err) {
-		if err = os.Mkdir(dirpath, fs.ModeDir); err != nil {
-			return fmt.Errorf("error creating directory %s: %w", dirpath, err)
-		}
-	} else {
-		return err
+	if err := os.MkdirAll(dirpath, 0755); err != nil {
+		return fmt.Errorf("error creating directory %s: %w", dirpath, err)
 	}
 
-	return filepath.WalkDir(dirpath, func(path string, d fs.DirEntry, err error) error {
-		itemRemotepath := filepath.Join(remotepath, d.Name())
-		if err != nil {
-			return err
+	listInput := &s3.ListObjectsInput{
+		Bucket: &config.AppConfig.S3Bucket,
+		Prefix: &remotepath,
+	}
+
+	out, err := bucket.s3Client.ListObjects(ctx, listInput)
+	if err != nil {
+		return fmt.Errorf("error fetching files: %w", err)
+	}
+
+	prefix := strings.TrimSuffix(remotepath, "/") + "/"
+	for _, file := range out.Contents {
+		objectPathInDir := strings.TrimPrefix(*file.Key, prefix)
+		localPath := filepath.Join(dirpath, objectPathInDir)
+
+		if err := bucket.GetFile(ctx, localPath, *file.Key); err != nil {
+			return fmt.Errorf("error downloading file %s: %w", *file.Key, err)
 		}
+	}
 
-		if d.IsDir() {
-			return bucket.GetDir(ctx, path, itemRemotepath)
-		}
-
-		return bucket.GetFile(ctx, path, itemRemotepath)
-	})
-
+	return nil
 }
 
 func (bucket *S3Bucket) UploadFile(ctx context.Context, filepath, remotepath string) error {
@@ -163,7 +171,7 @@ func (bucket *S3Bucket) deleteFile(ctx context.Context, key string) error {
 
 func (bucket *S3Bucket) SyncWorkspace(ctx context.Context, agent *types.Agent) error {
 	workspacePath := agent.GetHostWorkspacePath()
-	remotePath := agent.GetHostWorkspacePath()
+	remotePath := agent.GetRemoteWorkspacePath()
 
 	// first delete the ones that do not exist localy
 	listInput := &s3.ListObjectsInput{
@@ -178,7 +186,7 @@ func (bucket *S3Bucket) SyncWorkspace(ctx context.Context, agent *types.Agent) e
 	}
 
 	for _, object := range output.Contents {
-		objectPathInWorkspace := filepath.Base(*object.Key)
+		objectPathInWorkspace := (*object.Key)[len(remotePath):]
 		_, err := os.Stat(filepath.Join(workspacePath, objectPathInWorkspace))
 		if err == nil {
 			continue
@@ -200,7 +208,7 @@ func (bucket *S3Bucket) SyncWorkspace(ctx context.Context, agent *types.Agent) e
 
 func (bucket *S3Bucket) LoadWorkspace(ctx context.Context, agent *types.Agent) error {
 	workspacePath := agent.GetHostWorkspacePath()
-	remotePath := agent.GetHostWorkspacePath()
+	remotePath := agent.GetRemoteWorkspacePath()
 
 	return bucket.GetDir(ctx, workspacePath, remotePath)
 }

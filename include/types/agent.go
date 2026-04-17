@@ -1,7 +1,7 @@
 package types
 
 import (
-	"fmt"
+	"path/filepath"
 
 	"github.com/bruhugo/PicoClawProjectRuntime/include/config"
 	"github.com/moby/moby/api/types/container"
@@ -35,23 +35,36 @@ func (agent Agent) GetResources() container.Resources {
 	}
 }
 
+// HOST PATH 	-> the path on the host machine
+// AGENT PATH 	-> the path inside the agent's container
+// REMOTE PATH	-> blobstorage key
+
 func (agent Agent) GetHostWorkspacePath() string {
-	return fmt.Sprintf("/home/%s/agents/%s/workspace", config.AppConfig.SystemUser, agent.ID)
+	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agent.ID, "workspace")
+}
+func (agent Agent) GetHostConfigPath() string {
+	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agent.ID, "config.json")
+}
+func (agent Agent) GetHostLogsPath() string {
+	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agent.ID, "logs")
+}
+
+func (agent Agent) GetAgentLogsPath() string {
+	return filepath.Join("/root", ".picoclaw", "logs")
 }
 func (agent Agent) GetAgentWorkspacePath() string {
-	return fmt.Sprintf("/home/%s/agents/.picoclaw/workspace", agent.Name)
-}
-
-func (agent Agent) GetHostLogsPath() string {
-	return fmt.Sprintf("/home/%s/agents/%s/logs", config.AppConfig.SystemUser, agent.ID)
-}
-func (agent Agent) GetAgentLogsPath() string {
-	return fmt.Sprintf("/home/%s/agents/.picoclaw/logs", agent.Name)
-}
-
-func (agent Agent) GetHostConfigPath() string {
-	return fmt.Sprintf("/home/%s/agents/%s/config.json", config.AppConfig.SystemUser, agent.ID)
+	return filepath.Join("/root", ".picoclaw", "workspace")
 }
 func (agent Agent) GetAgentConfigPath() string {
-	return fmt.Sprintf("/home/%s/agents/.picoclaw/config.json", agent.Name)
+	return filepath.Join("/home", ".picoclaw", "config.json")
+}
+
+func (agent Agent) GetRemoteWorkspacePath() string {
+	return filepath.Join("agents", agent.ID, "workspace")
+}
+func (agent Agent) GetRemoteLogsPath() string {
+	return filepath.Join("agents", agent.ID, "logs")
+}
+func (agent Agent) GetRemoteConfigPath() string {
+	return filepath.Join("agents", agent.ID, "config.json")
 }
