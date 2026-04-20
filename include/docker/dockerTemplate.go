@@ -17,7 +17,7 @@ import (
 )
 
 type DockerTemplate interface {
-	Start(ctx context.Context) error
+	Start() error
 	Close()
 
 	PullPicoclawImage(ctx context.Context) error
@@ -32,39 +32,68 @@ type DockerTemplate interface {
 	GetAgentStats(ctx context.Context) ([]types.AgentStats, error)
 }
 
+type AgentCtx struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
 type DockerTemplateImpl struct {
 	blobstorage blobstorage.BlobStorage
 	client      client.APIClient
+
+	appCtx context.Context
+
+	agentContext map[string]AgentCtx
 }
 
-func NewDockerTemplateImpl(blobstorage blobstorage.BlobStorage) *DockerTemplateImpl {
+func NewDockerTemplateImpl(blobstorage blobstorage.BlobStorage, appCtx context.Context) *DockerTemplateImpl {
 	return &DockerTemplateImpl{
-		blobstorage: blobstorage,
+		blobstorage:  blobstorage,
+		appCtx:       appCtx,
+		agentContext: make(map[string]AgentCtx),
 	}
 }
 
-func (t *DockerTemplateImpl) Start(ctx context.Context) error {
+func (t *DockerTemplateImpl) Start() error {
 	client, err := client.New(client.FromEnv)
 	if err != nil {
 		return fmt.Errorf("error creating docker cdlient: %w", err)
 	}
 
-	err = t.blobstorage.Start(ctx)
+	err = t.blobstorage.Start(t.appCtx)
 	if err != nil {
 		return fmt.Errorf("error starting blobstorage: %w", err)
 	}
 
 	t.client = client
 
+	if err = t.PullPicoclawImage(t.appCtx); err != nil {
+		return fmt.Errorf("error pulling picoclaw image: %s", err)
+	}
+
 	if err = CreateStateFile(); err != nil {
 		return err
 	}
+	previousStates, err := ReadStateFile()
+	if err != nil {
+		return err
+	}
+	for _, state := range previousStates {
+		if t.StartAgentContainer(t.appCtx, &state.Agent, &state.Container) != nil {
+			return fmt.Errorf("error starting previous containers")
+		}
+	}
+
+	go t.streamVpsMetrics(t.appCtx)
 
 	return nil
 }
 
 func (t *DockerTemplateImpl) Close() {
 	t.client.Close()
+	for _, agentContext := range t.agentContext {
+		agentContext.cancel()
+	}
 }
 
 func (t *DockerTemplateImpl) PullPicoclawImage(ctx context.Context) error {
@@ -120,17 +149,17 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 		return nil, fmt.Errorf("error creating logs dir: %w", err)
 	}
 
-	_, err = os.OpenFile(agent.GetHostConfigPath(), os.O_CREATE, 0644)
+	configFile, err := os.OpenFile(agent.GetHostConfigPath(), os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("error creating config file: %w", err)
 	}
+	configFile.Close()
 
 	createOptions := client.ContainerCreateOptions{
 		Image: config.AppConfig.PicoclawImage,
 		Name:  agent.ID,
 		Config: &container.Config{
 			Labels: labels,
-			User:   agent.Name,
 		},
 		HostConfig: &container.HostConfig{
 			Resources: agent.GetResources(),
@@ -141,15 +170,15 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 					Target: agent.GetAgentWorkspacePath(),
 				},
 				{
-					Type:     mount.TypeBind,
-					Source:   agent.GetHostLogsPath(),
-					Target:   agent.GetAgentLogsPath(),
-					ReadOnly: true,
+					Type:   mount.TypeBind,
+					Source: agent.GetHostLogsPath(),
+					Target: agent.GetAgentLogsPath(),
 				},
 				{
-					Type:   mount.TypeBind,
-					Source: agent.GetHostConfigPath(),
-					Target: agent.GetAgentConfigPath(),
+					Type:     mount.TypeBind,
+					Source:   agent.GetHostConfigPath(),
+					Target:   agent.GetAgentConfigPath(),
+					ReadOnly: true,
 				},
 			},
 		},
@@ -197,6 +226,16 @@ func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *typ
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
 	)
+
+	agentContext, cancel := context.WithCancel(t.appCtx)
+	t.agentContext[agent.ID] = AgentCtx{
+		ctx:    agentContext,
+		cancel: cancel,
+	}
+
+	go t.sendLogs(agent, container)
+	go t.syncWorkspace(agent)
+
 	return nil
 }
 

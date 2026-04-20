@@ -31,16 +31,16 @@ func main() {
 	v1.Use(errors.ErrorHandler())
 
 	// DEPENDENCIES
-	blobstorage := blobstorage.NewS3Bucket()
-	dockerTemplate := docker.NewDockerTemplateImpl(blobstorage)
-
 	ctx := context.Background()
-	dockerTemplate.Start(ctx)
+	blobstorage := blobstorage.NewS3Bucket()
+	dockerTemplate := docker.NewDockerTemplateImpl(blobstorage, ctx)
+
+	dockerTemplate.Start()
 
 	// HANDLERS
 	containerHandler := handlers.NewContainerHanlder(dockerTemplate)
 
 	v1.POST("/agents", containerHandler.CreateAgent)
 
-	router.Run(":8080")
+	router.Run(":9090")
 }

@@ -56,7 +56,7 @@ func (agent Agent) GetAgentWorkspacePath() string {
 	return filepath.Join("/root", ".picoclaw", "workspace")
 }
 func (agent Agent) GetAgentConfigPath() string {
-	return filepath.Join("/home", ".picoclaw", "config.json")
+	return filepath.Join("/root", ".picoclaw", "config.json")
 }
 
 func (agent Agent) GetRemoteWorkspacePath() string {

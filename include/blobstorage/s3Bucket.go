@@ -62,7 +62,7 @@ func (bucket *S3Bucket) GetFile(ctx context.Context, path, remotepath string) er
 	if err = os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("error creating directories for file %s: %s", path, err)
 	}
-	file, err := os.OpenFile(filepath.Dir(path), os.O_CREATE|os.O_WRONLY, 0)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("error to open/create file %s: %w", path, err)
 	}
@@ -90,7 +90,6 @@ func (bucket *S3Bucket) GetDir(ctx context.Context, dirpath, remotepath string) 
 	if err != nil {
 		return fmt.Errorf("error fetching files: %w", err)
 	}
-
 	prefix := strings.TrimSuffix(remotepath, "/") + "/"
 	for _, file := range out.Contents {
 		objectPathInDir := strings.TrimPrefix(*file.Key, prefix)
@@ -104,19 +103,25 @@ func (bucket *S3Bucket) GetDir(ctx context.Context, dirpath, remotepath string) 
 	return nil
 }
 
-func (bucket *S3Bucket) UploadFile(ctx context.Context, filepath, remotepath string) error {
-	file, err := os.OpenFile(filepath, os.O_RDONLY, 0)
+func (bucket *S3Bucket) UploadFile(ctx context.Context, localpath, remotepath string) error {
+	file, err := os.OpenFile(localpath, os.O_RDONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("error opening file %s: %w", filepath, err)
+		return fmt.Errorf("error opening file %s: %w", localpath, err)
 	}
-	_, err = bucket.s3Client.PutObject(ctx, &s3.PutObjectInput{
+	if err = bucket.UploadBuffer(ctx, file, remotepath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (bucket *S3Bucket) UploadBuffer(ctx context.Context, buffer io.Reader, remotepath string) error {
+	_, err := bucket.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Key:    &remotepath,
 		Bucket: &config.AppConfig.S3Bucket,
-		Body:   file,
+		Body:   buffer,
 	})
-
 	if err != nil {
-		return fmt.Errorf("error uploading file %s to S3: %w", filepath, err)
+		return fmt.Errorf("error uploading blob %s to S3: %w", remotepath, err)
 	}
 	return nil
 }
