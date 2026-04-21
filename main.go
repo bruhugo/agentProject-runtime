@@ -38,9 +38,14 @@ func main() {
 	dockerTemplate.Start()
 
 	// HANDLERS
-	containerHandler := handlers.NewContainerHanlder(dockerTemplate)
+	agentHandler := handlers.NewAgentHanlder(dockerTemplate)
 
-	v1.POST("/agents", containerHandler.CreateAgent)
+	v1.POST("/agents", agentHandler.CreateAgent)
+	v1.PUT("/agents/:agentId/stop", agentHandler.StopAgent)
+	v1.GET("/agents/:agentId/stats", agentHandler.GetAgentStats)
+
+	// makes the agent load config file from blobstorage
+	v1.PUT("/agents/:agentId/config", agentHandler.UpdadeConfigFile)
 
 	router.Run(":9090")
 }

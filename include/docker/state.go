@@ -99,3 +99,16 @@ func RemoveAgentFromState(agentID string) error {
 
 	return writeStateFile(newState)
 }
+
+func FindAgentStateFile(agentID string) (*types.AgentState, error) {
+	states, err := ReadStateFile()
+	if err != nil {
+		return nil, fmt.Errorf("error reading from state file: %w", err)
+	}
+
+	for _, state := range states {
+		return &state, nil
+	}
+
+	return nil, fmt.Errorf("no container running with agent id %s", agentID)
+}

@@ -29,6 +29,7 @@ func NewS3Bucket() *S3Bucket {
 }
 
 func (bucket *S3Bucket) Start(ctx context.Context) error {
+	slog.Info("starting s3 blobstorage client", "region", config.AppConfig.S3Region, "bucket", config.AppConfig.S3Bucket)
 	awsConfig, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(config.AppConfig.S3Region),
 		awsconfig.WithCredentialsProvider(
@@ -49,6 +50,7 @@ func (bucket *S3Bucket) Start(ctx context.Context) error {
 }
 
 func (bucket *S3Bucket) GetFile(ctx context.Context, path, remotepath string) error {
+	slog.Debug("fetching file from s3", "remotePath", remotepath, "localPath", path)
 	getObjectInput := &s3.GetObjectInput{
 		Bucket: &config.AppConfig.S3Bucket,
 		Key:    &remotepath,
@@ -77,6 +79,7 @@ func (bucket *S3Bucket) GetFile(ctx context.Context, path, remotepath string) er
 }
 
 func (bucket *S3Bucket) GetDir(ctx context.Context, dirpath, remotepath string) error {
+	slog.Info("fetching directory from s3", "remotePath", remotepath, "localPath", dirpath)
 	if err := os.MkdirAll(dirpath, 0755); err != nil {
 		return fmt.Errorf("error creating directory %s: %w", dirpath, err)
 	}
@@ -104,6 +107,7 @@ func (bucket *S3Bucket) GetDir(ctx context.Context, dirpath, remotepath string) 
 }
 
 func (bucket *S3Bucket) UploadFile(ctx context.Context, localpath, remotepath string) error {
+	slog.Debug("uploading file to s3", "localPath", localpath, "remotePath", remotepath)
 	file, err := os.OpenFile(localpath, os.O_RDONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("error opening file %s: %w", localpath, err)
@@ -115,6 +119,7 @@ func (bucket *S3Bucket) UploadFile(ctx context.Context, localpath, remotepath st
 }
 
 func (bucket *S3Bucket) UploadBuffer(ctx context.Context, buffer io.Reader, remotepath string) error {
+	slog.Debug("uploading buffer to s3", "remotePath", remotepath)
 	_, err := bucket.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Key:    &remotepath,
 		Bucket: &config.AppConfig.S3Bucket,
@@ -127,7 +132,7 @@ func (bucket *S3Bucket) UploadBuffer(ctx context.Context, buffer io.Reader, remo
 }
 
 func (bucket *S3Bucket) UploadDir(ctx context.Context, dirpath, remotepath string) error {
-	slog.Debug("uploading directory", "path", dirpath)
+	slog.Info("uploading directory to s3", "path", dirpath, "remotePath", remotepath)
 
 	stat, err := os.Stat(dirpath)
 	if err != nil {
@@ -135,7 +140,7 @@ func (bucket *S3Bucket) UploadDir(ctx context.Context, dirpath, remotepath strin
 	}
 	lastChanged, ok := bucket.changeMap[dirpath]
 	if ok && stat.ModTime().Equal(lastChanged) {
-		slog.Debug("directory unchanged", "path", dirpath)
+		slog.Debug("directory unchanged, skipping upload", "path", dirpath)
 		return nil
 	}
 	bucket.changeMap[dirpath] = stat.ModTime()
@@ -161,6 +166,7 @@ func (bucket *S3Bucket) UploadDir(ctx context.Context, dirpath, remotepath strin
 }
 
 func (bucket *S3Bucket) deleteFile(ctx context.Context, key string) error {
+	slog.Info("deleting file from s3", "key", key)
 	deleteInput := &s3.DeleteObjectInput{
 		Bucket: &config.AppConfig.S3Bucket,
 		Key:    aws.String(key),
@@ -175,8 +181,9 @@ func (bucket *S3Bucket) deleteFile(ctx context.Context, key string) error {
 }
 
 func (bucket *S3Bucket) SyncWorkspace(ctx context.Context, agent *types.Agent) error {
-	workspacePath := agent.GetHostWorkspacePath()
-	remotePath := agent.GetRemoteWorkspacePath()
+	slog.Debug("syncing workspace with s3", "agentId", agent.ID)
+	workspacePath := types.GetHostWorkspacePath(agent.ID)
+	remotePath := types.GetRemoteWorkspacePath(agent.ID)
 
 	// first delete the ones that do not exist localy
 	listInput := &s3.ListObjectsInput{
@@ -212,8 +219,9 @@ func (bucket *S3Bucket) SyncWorkspace(ctx context.Context, agent *types.Agent) e
 }
 
 func (bucket *S3Bucket) LoadWorkspace(ctx context.Context, agent *types.Agent) error {
-	workspacePath := agent.GetHostWorkspacePath()
-	remotePath := agent.GetRemoteWorkspacePath()
+	slog.Info("loading workspace from s3", "agentId", agent.ID)
+	workspacePath := types.GetHostWorkspacePath(agent.ID)
+	remotePath := types.GetRemoteWorkspacePath(agent.ID)
 
 	return bucket.GetDir(ctx, workspacePath, remotePath)
 }

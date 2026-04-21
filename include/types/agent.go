@@ -26,7 +26,7 @@ type Agent struct {
 	Tier        Tier   `json:"tier"`
 }
 
-func (agent Agent) GetResources() container.Resources {
+func GetAgentResources(agent *Agent) container.Resources {
 	return container.Resources{
 		NanoCPUs: int64(agent.Tier.Limits.Cpu * 1e9),
 
@@ -39,32 +39,32 @@ func (agent Agent) GetResources() container.Resources {
 // AGENT PATH 	-> the path inside the agent's container
 // REMOTE PATH	-> blobstorage key
 
-func (agent Agent) GetHostWorkspacePath() string {
-	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agent.ID, "workspace")
+func GetHostWorkspacePath(agentID string) string {
+	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agentID, "workspace")
 }
-func (agent Agent) GetHostConfigPath() string {
-	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agent.ID, "config.json")
+func GetHostConfigPath(agentID string) string {
+	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agentID, "config.json")
 }
-func (agent Agent) GetHostLogsPath() string {
-	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agent.ID, "logs")
+func GetHostLogsPath(agentID string) string {
+	return filepath.Join("/home", config.AppConfig.SystemUser, "agents", agentID, "logs")
 }
 
-func (agent Agent) GetAgentLogsPath() string {
+func GetAgentLogsPath() string {
 	return filepath.Join("/root", ".picoclaw", "logs")
 }
-func (agent Agent) GetAgentWorkspacePath() string {
+func GetAgentWorkspacePath() string {
 	return filepath.Join("/root", ".picoclaw", "workspace")
 }
-func (agent Agent) GetAgentConfigPath() string {
+func GetAgentConfigPath() string {
 	return filepath.Join("/root", ".picoclaw", "config.json")
 }
 
-func (agent Agent) GetRemoteWorkspacePath() string {
-	return filepath.Join("agents", agent.ID, "workspace")
+func GetRemoteWorkspacePath(agentID string) string {
+	return filepath.Join("agents", agentID, "workspace")
 }
-func (agent Agent) GetRemoteLogsPath() string {
-	return filepath.Join("agents", agent.ID, "logs")
+func GetRemoteLogsPath(agentID string) string {
+	return filepath.Join("agents", agentID, "logs")
 }
-func (agent Agent) GetRemoteConfigPath() string {
-	return filepath.Join("agents", agent.ID, "config.json")
+func GetRemoteConfigPath(agentID string) string {
+	return filepath.Join("agents", agentID, "config.json")
 }

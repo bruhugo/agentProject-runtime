@@ -24,12 +24,16 @@ type DockerTemplate interface {
 
 	CreateAgentContainer(ctx context.Context, agent *types.Agent) (*types.Container, error)
 	StartAgentContainer(ctx context.Context, agent *types.Agent, container *types.Container) error
+	StopAgent(ctx context.Context, agentId string) error
 
 	FindByUserID(ctx context.Context, userId string) ([]*types.Container, error)
 	FindByAgentID(ctx context.Context, containerId string) (*types.Container, error)
 	FindAll(ctx context.Context) ([]*types.Container, error)
 
 	GetAgentStats(ctx context.Context) ([]types.AgentStats, error)
+	GetSingleAgentStats(ctx context.Context, agentID string) (*types.AgentStats, error)
+
+	UpdadeConfigFile(ctx context.Context, agentID string) error
 }
 
 type AgentCtx struct {
@@ -55,6 +59,7 @@ func NewDockerTemplateImpl(blobstorage blobstorage.BlobStorage, appCtx context.C
 }
 
 func (t *DockerTemplateImpl) Start() error {
+	slog.Info("starting docker template")
 	client, err := client.New(client.FromEnv)
 	if err != nil {
 		return fmt.Errorf("error creating docker cdlient: %w", err)
@@ -78,6 +83,11 @@ func (t *DockerTemplateImpl) Start() error {
 	if err != nil {
 		return err
 	}
+
+	if len(previousStates) > 0 {
+		slog.Info("restarting previous containers", "count", len(previousStates))
+	}
+
 	for _, state := range previousStates {
 		if t.StartAgentContainer(t.appCtx, &state.Agent, &state.Container) != nil {
 			return fmt.Errorf("error starting previous containers")
@@ -90,8 +100,10 @@ func (t *DockerTemplateImpl) Start() error {
 }
 
 func (t *DockerTemplateImpl) Close() {
+	slog.Info("closing docker template")
 	t.client.Close()
-	for _, agentContext := range t.agentContext {
+	for id, agentContext := range t.agentContext {
+		slog.Debug("cancelling agent context", "agentId", id)
 		agentContext.cancel()
 	}
 }
@@ -99,7 +111,7 @@ func (t *DockerTemplateImpl) Close() {
 func (t *DockerTemplateImpl) PullPicoclawImage(ctx context.Context) error {
 	image := config.AppConfig.PicoclawImage
 
-	slog.Debug("pulling picoclaw image",
+	slog.Info("pulling picoclaw image",
 		slog.String("image", image))
 
 	res, err := t.client.ImagePull(ctx, image, client.ImagePullOptions{})
@@ -107,7 +119,7 @@ func (t *DockerTemplateImpl) PullPicoclawImage(ctx context.Context) error {
 		return fmt.Errorf("error pulling picoclaw image: %w", err)
 	}
 
-	slog.Debug("picoclaw image pulled",
+	slog.Info("picoclaw image pulled",
 		slog.String("image", image))
 
 	io.Copy(io.Discard, res)
@@ -117,7 +129,7 @@ func (t *DockerTemplateImpl) PullPicoclawImage(ctx context.Context) error {
 }
 
 func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *types.Agent) (*types.Container, error) {
-	slog.Debug("creating container",
+	slog.Info("creating container",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
 	)
@@ -128,7 +140,7 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 	}
 
 	if res != nil {
-		slog.Debug("container already exists",
+		slog.Info("container already exists, returning existing one",
 			slog.String("agentID", agent.ID),
 			slog.String("userID", agent.UserID),
 		)
@@ -139,21 +151,22 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 	labels["userId"] = agent.UserID
 	labels["agentId"] = agent.ID
 
+	slog.Debug("loading workspace from blobstorage", "agentId", agent.ID)
 	err = t.blobstorage.LoadWorkspace(ctx, agent)
 	if err != nil {
 		return nil, fmt.Errorf("error loading remote workspace: %w", err)
 	}
 
-	err = os.MkdirAll(agent.GetHostLogsPath(), 0755)
+	slog.Debug("loading config from blobstorage", "agentId", agent.ID)
+	err = t.blobstorage.GetFile(ctx, types.GetHostConfigPath(agent.ID), types.GetRemoteConfigPath(agent.ID))
+	if err != nil {
+		return nil, fmt.Errorf("error loading remote config.json: %w", err)
+	}
+
+	err = os.MkdirAll(types.GetHostLogsPath(agent.ID), 0755)
 	if err != nil {
 		return nil, fmt.Errorf("error creating logs dir: %w", err)
 	}
-
-	configFile, err := os.OpenFile(agent.GetHostConfigPath(), os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("error creating config file: %w", err)
-	}
-	configFile.Close()
 
 	createOptions := client.ContainerCreateOptions{
 		Image: config.AppConfig.PicoclawImage,
@@ -162,22 +175,22 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 			Labels: labels,
 		},
 		HostConfig: &container.HostConfig{
-			Resources: agent.GetResources(),
+			Resources: types.GetAgentResources(agent),
 			Mounts: []mount.Mount{
 				{
 					Type:   mount.TypeBind,
-					Source: agent.GetHostWorkspacePath(),
-					Target: agent.GetAgentWorkspacePath(),
+					Source: types.GetHostWorkspacePath(agent.ID),
+					Target: types.GetAgentWorkspacePath(),
 				},
 				{
 					Type:   mount.TypeBind,
-					Source: agent.GetHostLogsPath(),
-					Target: agent.GetAgentLogsPath(),
+					Source: types.GetHostLogsPath(agent.ID),
+					Target: types.GetAgentLogsPath(),
 				},
 				{
 					Type:     mount.TypeBind,
-					Source:   agent.GetHostConfigPath(),
-					Target:   agent.GetAgentConfigPath(),
+					Source:   types.GetHostConfigPath(agent.ID),
+					Target:   types.GetAgentConfigPath(),
 					ReadOnly: true,
 				},
 			},
@@ -196,23 +209,17 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 		State:   "created",
 	}
 
-	if err = AddAgentToState(agent, c); err != nil {
-		slog.Error("error adding agent to state file",
-			slog.String("agentID", agent.ID),
-			slog.Any("error", err),
-		)
-	}
-
-	slog.Debug("container created",
+	slog.Info("container created successfully",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
+		slog.String("containerID", c.ID),
 	)
 
 	return c, nil
 }
 
 func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *types.Agent, container *types.Container) error {
-	slog.Debug("starting container",
+	slog.Info("starting container",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
 	)
@@ -222,7 +229,14 @@ func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *typ
 		return fmt.Errorf("error starting container: %w", err)
 	}
 
-	slog.Debug("container started",
+	if err = AddAgentToState(agent, container); err != nil {
+		slog.Error("error adding agent to state file",
+			slog.String("agentID", agent.ID),
+			slog.Any("error", err),
+		)
+	}
+
+	slog.Info("container started successfully",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
 	)
@@ -233,6 +247,7 @@ func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *typ
 		cancel: cancel,
 	}
 
+	slog.Debug("starting background tasks for agent", "agentId", agent.ID)
 	go t.sendLogs(agent, container)
 	go t.syncWorkspace(agent)
 
@@ -347,4 +362,87 @@ func (t *DockerTemplateImpl) GetAgentStats(ctx context.Context) ([]types.AgentSt
 	}
 
 	return agentStats, nil
+}
+
+func (t *DockerTemplateImpl) GetSingleAgentStats(ctx context.Context, agentID string) (*types.AgentStats, error) {
+	state, err := FindAgentStateFile(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("error finding state: %w", err)
+	}
+
+	c, err := t.FindByAgentID(ctx, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving container: %w", err)
+	}
+
+	res, err := t.client.ContainerStats(ctx, c.ID, client.ContainerStatsOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving container stats: %w", err)
+	}
+
+	var stats container.StatsResponse
+	err = json.NewDecoder(res.Body).Decode(&stats)
+	res.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("error parsing response json: %w", err)
+	}
+	return &types.AgentStats{
+		AgentID: c.AgentID,
+		CpuUsage: types.CpuUsage{
+			CpuLimit: state.Agent.Tier.Limits.Cpu,
+			CpuUsed:  CalculateCpuUsed(&stats),
+		},
+		MemoryUsage: types.MemoryUsage{
+			MemoryLimitMb: state.Agent.Tier.Limits.MemoryMb,
+			MemoryUsedMb:  CalculateMemoryUsed(&stats),
+		},
+	}, nil
+}
+
+func (t *DockerTemplateImpl) StopAgent(ctx context.Context, agentId string) error {
+	slog.Info("stopping agent", "agentId", agentId)
+	c, err := t.FindByAgentID(ctx, agentId)
+	if err != nil {
+		return fmt.Errorf("error finding container: %w", err)
+	}
+
+	// container is already stopped
+	if c.State != container.StateRunning {
+		slog.Debug("container already stopped", "agentId", agentId, "state", c.State)
+		return nil
+	}
+
+	_, err = t.client.ContainerStop(ctx, c.ID, client.ContainerStopOptions{})
+	if err != nil {
+		return fmt.Errorf("error stoping container %s: %w", c.ID, err)
+	}
+
+	if err = RemoveAgentFromState(agentId); err != nil {
+		return fmt.Errorf("error removing container %s from state: %w", c.ID, err)
+	}
+
+	slog.Info("agent stopped successfully", "agentId", agentId)
+	return nil
+}
+
+func (t *DockerTemplateImpl) UpdadeConfigFile(ctx context.Context, agentID string) error {
+	slog.Info("updating config file for agent", "agentId", agentID)
+	c, err := t.FindByAgentID(ctx, agentID)
+	if err != nil {
+		return fmt.Errorf("error finding container: %w", err)
+	}
+
+	err = t.blobstorage.GetFile(ctx, types.GetHostConfigPath(agentID), types.GetRemoteConfigPath(agentID))
+	if err != nil {
+		return fmt.Errorf("error loading config file: %w", err)
+	}
+
+	slog.Debug("restarting container after config update", "agentId", agentID)
+	_, err = t.client.ContainerRestart(ctx, c.ID, client.ContainerRestartOptions{})
+	if err != nil {
+		return fmt.Errorf("error restarting container: %w", err)
+	}
+
+	slog.Info("agent config updated and container restarted", "agentId", agentID)
+	return nil
 }

@@ -42,12 +42,14 @@ func CalculateMemoryUsed(stats *container.StatsResponse) uint64 {
 }
 
 func (dockerTemplate DockerTemplateImpl) streamVpsMetrics(ctx context.Context) error {
+	slog.Info("starting vps metrics streaming")
 	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
+			slog.Debug("collecting vps metrics")
 			memStat, err := mem.VirtualMemoryWithContext(ctx)
 			if err != nil {
 				slog.Error("error getting memory stats", "error", err)
@@ -110,15 +112,19 @@ func (dockerTemplate DockerTemplateImpl) streamVpsMetrics(ctx context.Context) e
 
 			if resp.StatusCode >= 400 {
 				slog.Error("received error response from main node", "status", resp.Status)
+			} else {
+				slog.Debug("vps metrics sent successfully")
 			}
 
 		case <-ctx.Done():
+			slog.Info("stopping vps metrics streaming")
 			return nil
 		}
 	}
 }
 
 func (t *DockerTemplateImpl) syncWorkspace(agent *types.Agent) {
+	slog.Info("starting workspace sync background task", "agentId", agent.ID)
 	ctx, ok := t.agentContext[agent.ID]
 	if !ok {
 		slog.Error("must define the agent context before sending logs",
@@ -131,14 +137,17 @@ func (t *DockerTemplateImpl) syncWorkspace(agent *types.Agent) {
 	for {
 		select {
 		case <-ticker.C:
+			slog.Debug("triggering workspace sync", "agentId", agent.ID)
 			t.blobstorage.SyncWorkspace(ctx.ctx, agent)
 		case <-ctx.ctx.Done():
+			slog.Info("stopping workspace sync background task", "agentId", agent.ID)
 			return
 		}
 	}
 }
 
 func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Container) {
+	slog.Info("starting log streaming background task", "agentId", agent.ID)
 	ctx, ok := t.agentContext[agent.ID]
 	if !ok {
 		slog.Error("must define the agent context before sending logs",
@@ -170,7 +179,8 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 					continue
 				}
 
-				remotepath := filepath.Join(agent.GetRemoteLogsPath(), time.Now().Local().String())
+				remotepath := filepath.Join(types.GetRemoteLogsPath(agent.ID), time.Now().Local().String())
+				slog.Debug("uploading logs due to timeout", "agentId", agent.ID, "remotePath", remotepath)
 				err = t.blobstorage.UploadBuffer(ctx.ctx, buffer, remotepath)
 				if err != nil {
 					slog.Error("error sending log file",
@@ -181,6 +191,7 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 				}
 				buffer.Reset()
 			case <-ctx.ctx.Done():
+				slog.Info("stopping log streaming background task (timer)", "agentId", agent.ID)
 				return
 			}
 		}
@@ -191,7 +202,8 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 		defer mutex.Unlock()
 
 		if len(scanner.Bytes())+buffer.Len() >= BUFFER_SIZE {
-			remotepath := filepath.Join(agent.GetRemoteLogsPath(), time.Now().Local().String())
+			remotepath := filepath.Join(types.GetRemoteLogsPath(agent.ID), time.Now().Local().String())
+			slog.Debug("uploading logs due to buffer full", "agentId", agent.ID, "remotePath", remotepath)
 			err = t.blobstorage.UploadBuffer(ctx.ctx, buffer, remotepath)
 			if err != nil {
 				slog.Error("error sending log file",
@@ -200,7 +212,7 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 					"error", err.Error())
 				continue
 			}
-			slog.Debug("logs uploaded",
+			slog.Info("logs uploaded successfully",
 				"agentId", agent.ID,
 				"userId", agent.UserID)
 			buffer.Reset()
@@ -209,4 +221,5 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 		buffer.Write(scanner.Bytes())
 		buffer.WriteByte('\n')
 	}
+	slog.Info("stopping log streaming background task (scanner finished)", "agentId", agent.ID)
 }

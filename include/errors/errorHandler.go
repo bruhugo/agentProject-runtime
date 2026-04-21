@@ -22,6 +22,10 @@ func ErrorHandler() gin.HandlerFunc {
 					"userId", httpError.UserID,
 					"agentId", httpError.AgentID,
 					"error", httpError.Unwrap().Error())
+
+				if httpError.Status == 0 {
+					httpError.Status = http.StatusInternalServerError
+				}
 				ctx.JSON(httpError.Status, httpError)
 				return
 			}
