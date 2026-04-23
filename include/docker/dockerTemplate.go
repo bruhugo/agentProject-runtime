@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"sync"
 
 	"github.com/bruhugo/PicoClawProjectRuntime/include/blobstorage"
 	"github.com/bruhugo/PicoClawProjectRuntime/include/config"
@@ -33,6 +35,8 @@ type DockerTemplate interface {
 	GetAgentStats(ctx context.Context) ([]types.AgentStats, error)
 	GetSingleAgentStats(ctx context.Context, agentID string) (*types.AgentStats, error)
 
+	DeleteAgent(ctx context.Context, agentID string) error
+
 	UpdadeConfigFile(ctx context.Context, agentID string) error
 }
 
@@ -47,7 +51,8 @@ type DockerTemplateImpl struct {
 
 	appCtx context.Context
 
-	agentContext map[string]AgentCtx
+	agentContext   map[string]AgentCtx
+	agentContextMu sync.RWMutex
 }
 
 func NewDockerTemplateImpl(blobstorage blobstorage.BlobStorage, appCtx context.Context) *DockerTemplateImpl {
@@ -60,7 +65,7 @@ func NewDockerTemplateImpl(blobstorage blobstorage.BlobStorage, appCtx context.C
 
 func (t *DockerTemplateImpl) Start() error {
 	slog.Info("starting docker template")
-	client, err := client.New(client.FromEnv)
+	c, err := client.New(client.FromEnv)
 	if err != nil {
 		return fmt.Errorf("error creating docker cdlient: %w", err)
 	}
@@ -70,27 +75,39 @@ func (t *DockerTemplateImpl) Start() error {
 		return fmt.Errorf("error starting blobstorage: %w", err)
 	}
 
-	t.client = client
+	t.client = c
 
 	if err = t.PullPicoclawImage(t.appCtx); err != nil {
 		return fmt.Errorf("error pulling picoclaw image: %s", err)
 	}
 
-	if err = CreateStateFile(); err != nil {
-		return err
-	}
-	previousStates, err := ReadStateFile()
-	if err != nil {
-		return err
-	}
+	// Recovering background tasks for existing containers
+	filters := make(client.Filters)
+	filters.Add("label", "agentId")
+	res, err := t.client.ContainerList(t.appCtx, client.ContainerListOptions{Filters: filters, All: true})
+	if err == nil {
+		for _, c := range res.Items {
+			agentID := c.Labels["agentId"]
+			userID := c.Labels["userId"]
+			agent := &types.Agent{ID: agentID, UserID: userID}
+			containerObj := &types.Container{ID: c.ID, AgentID: agentID, UserID: userID}
 
-	if len(previousStates) > 0 {
-		slog.Info("restarting previous containers", "count", len(previousStates))
-	}
+			// If container is not running, try to start it
+			if c.State != "running" {
+				slog.Info("restarting existing container", "agentId", agentID, "state", c.State)
+				if _, err := t.client.ContainerStart(t.appCtx, c.ID, client.ContainerStartOptions{}); err != nil {
+					slog.Error("failed to restart existing container", "agentId", agentID, "error", err)
+					continue
+				}
+			}
 
-	for _, state := range previousStates {
-		if t.StartAgentContainer(t.appCtx, &state.Agent, &state.Container) != nil {
-			return fmt.Errorf("error starting previous containers")
+			agentContext, cancel := context.WithCancel(t.appCtx)
+			t.agentContextMu.Lock()
+			t.agentContext[agentID] = AgentCtx{ctx: agentContext, cancel: cancel}
+			t.agentContextMu.Unlock()
+
+			go t.sendLogs(agent, containerObj)
+			go t.syncWorkspace(agent)
 		}
 	}
 
@@ -102,6 +119,8 @@ func (t *DockerTemplateImpl) Start() error {
 func (t *DockerTemplateImpl) Close() {
 	slog.Info("closing docker template")
 	t.client.Close()
+	t.agentContextMu.Lock()
+	defer t.agentContextMu.Unlock()
 	for id, agentContext := range t.agentContext {
 		slog.Debug("cancelling agent context", "agentId", id)
 		agentContext.cancel()
@@ -150,6 +169,8 @@ func (t *DockerTemplateImpl) CreateAgentContainer(ctx context.Context, agent *ty
 	labels := make(map[string]string)
 	labels["userId"] = agent.UserID
 	labels["agentId"] = agent.ID
+	labels["cpuLimit"] = fmt.Sprintf("%f", agent.Tier.Limits.Cpu)
+	labels["memLimit"] = fmt.Sprintf("%d", agent.Tier.Limits.MemoryMb)
 
 	slog.Debug("loading workspace from blobstorage", "agentId", agent.ID)
 	err = t.blobstorage.LoadWorkspace(ctx, agent)
@@ -229,23 +250,18 @@ func (t *DockerTemplateImpl) StartAgentContainer(ctx context.Context, agent *typ
 		return fmt.Errorf("error starting container: %w", err)
 	}
 
-	if err = AddAgentToState(agent, container); err != nil {
-		slog.Error("error adding agent to state file",
-			slog.String("agentID", agent.ID),
-			slog.Any("error", err),
-		)
-	}
-
 	slog.Info("container started successfully",
 		slog.String("agentID", agent.ID),
 		slog.String("userID", agent.UserID),
 	)
 
 	agentContext, cancel := context.WithCancel(t.appCtx)
+	t.agentContextMu.Lock()
 	t.agentContext[agent.ID] = AgentCtx{
 		ctx:    agentContext,
 		cancel: cancel,
 	}
+	t.agentContextMu.Unlock()
 
 	slog.Debug("starting background tasks for agent", "agentId", agent.ID)
 	go t.sendLogs(agent, container)
@@ -327,16 +343,23 @@ func (t *DockerTemplateImpl) FindAll(ctx context.Context) ([]*types.Container, e
 }
 
 func (t *DockerTemplateImpl) GetAgentStats(ctx context.Context) ([]types.AgentStats, error) {
-	states, err := ReadStateFile()
+	filters := make(client.Filters)
+	filters.Add("label", "agentId")
+
+	res, err := t.client.ContainerList(ctx, client.ContainerListOptions{
+		Filters: filters,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to read from state file: %w", err)
+		return nil, fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	agentStats := make([]types.AgentStats, 0)
-	for _, state := range states {
-		res, err := t.client.ContainerStats(ctx, state.Container.ID, client.ContainerStatsOptions{})
+	for _, c := range res.Items {
+		agentID := c.Labels["agentId"]
+
+		res, err := t.client.ContainerStats(ctx, c.ID, client.ContainerStatsOptions{Stream: false})
 		if err != nil {
-			slog.Error("error getting container stats", slog.String("agentID", state.Agent.ID), slog.Any("error", err))
+			slog.Error("error getting container stats", slog.String("agentID", agentID), slog.Any("error", err))
 			continue
 		}
 
@@ -344,18 +367,23 @@ func (t *DockerTemplateImpl) GetAgentStats(ctx context.Context) ([]types.AgentSt
 		err = json.NewDecoder(res.Body).Decode(&stats)
 		res.Body.Close()
 		if err != nil {
-			slog.Error("error parsing stats response", slog.String("agentID", state.Agent.ID), slog.Any("error", err))
+			slog.Error("error parsing stats response", slog.String("agentID", agentID), slog.Any("error", err))
 			continue
 		}
 
+		var cpuLimit float64
+		var memLimit uint64
+		fmt.Sscanf(c.Labels["cpuLimit"], "%f", &cpuLimit)
+		fmt.Sscanf(c.Labels["memLimit"], "%d", &memLimit)
+
 		agentStats = append(agentStats, types.AgentStats{
-			AgentID: state.Agent.ID,
+			AgentID: agentID,
 			CpuUsage: types.CpuUsage{
-				CpuLimit: state.Agent.Tier.Limits.Cpu,
+				CpuLimit: cpuLimit,
 				CpuUsed:  CalculateCpuUsed(&stats),
 			},
 			MemoryUsage: types.MemoryUsage{
-				MemoryLimitMb: state.Agent.Tier.Limits.MemoryMb,
+				MemoryLimitMb: memLimit,
 				MemoryUsedMb:  CalculateMemoryUsed(&stats),
 			},
 		})
@@ -365,17 +393,12 @@ func (t *DockerTemplateImpl) GetAgentStats(ctx context.Context) ([]types.AgentSt
 }
 
 func (t *DockerTemplateImpl) GetSingleAgentStats(ctx context.Context, agentID string) (*types.AgentStats, error) {
-	state, err := FindAgentStateFile(agentID)
-	if err != nil {
-		return nil, fmt.Errorf("error finding state: %w", err)
-	}
-
 	c, err := t.FindByAgentID(ctx, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("error retrieving container: %w", err)
 	}
 
-	res, err := t.client.ContainerStats(ctx, c.ID, client.ContainerStatsOptions{})
+	res, err := t.client.ContainerStats(ctx, c.ID, client.ContainerStatsOptions{Stream: false})
 	if err != nil {
 		return nil, fmt.Errorf("error retrieving container stats: %w", err)
 	}
@@ -386,14 +409,25 @@ func (t *DockerTemplateImpl) GetSingleAgentStats(ctx context.Context, agentID st
 	if err != nil {
 		return nil, fmt.Errorf("error parsing response json: %w", err)
 	}
+
+	inspect, err := t.client.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("error inspecting container: %w", err)
+	}
+
+	var cpuLimit float64
+	var memLimit uint64
+	fmt.Sscanf(inspect.Container.Config.Labels["cpuLimit"], "%f", &cpuLimit)
+	fmt.Sscanf(inspect.Container.Config.Labels["memLimit"], "%d", &memLimit)
+
 	return &types.AgentStats{
 		AgentID: c.AgentID,
 		CpuUsage: types.CpuUsage{
-			CpuLimit: state.Agent.Tier.Limits.Cpu,
+			CpuLimit: cpuLimit,
 			CpuUsed:  CalculateCpuUsed(&stats),
 		},
 		MemoryUsage: types.MemoryUsage{
-			MemoryLimitMb: state.Agent.Tier.Limits.MemoryMb,
+			MemoryLimitMb: memLimit,
 			MemoryUsedMb:  CalculateMemoryUsed(&stats),
 		},
 	}, nil
@@ -417,11 +451,50 @@ func (t *DockerTemplateImpl) StopAgent(ctx context.Context, agentId string) erro
 		return fmt.Errorf("error stoping container %s: %w", c.ID, err)
 	}
 
-	if err = RemoveAgentFromState(agentId); err != nil {
-		return fmt.Errorf("error removing container %s from state: %w", c.ID, err)
+	slog.Info("agent stopped successfully", "agentId", agentId)
+	return nil
+}
+
+func (t *DockerTemplateImpl) DeleteAgent(ctx context.Context, agentID string) error {
+	slog.Info("deleting agent", "agentId", agentID)
+
+	err := t.StopAgent(ctx, agentID)
+	if err != nil {
+		slog.Warn("error stopping agent during deletion, proceeding anyway", "agentId", agentID, "error", err)
 	}
 
-	slog.Info("agent stopped successfully", "agentId", agentId)
+	t.agentContextMu.Lock()
+	if agentCtx, ok := t.agentContext[agentID]; ok {
+		agentCtx.cancel()
+		delete(t.agentContext, agentID)
+	}
+	t.agentContextMu.Unlock()
+
+	slog.Debug("performing final workspace sync", "agentId", agentID)
+	agent := &types.Agent{ID: agentID} // We only need ID for paths
+	err = t.blobstorage.SyncWorkspace(ctx, agent)
+	if err != nil {
+		slog.Error("failed to perform final workspace sync", "agentId", agentID, "error", err)
+	}
+
+	c, err := t.FindByAgentID(ctx, agentID)
+	if err != nil {
+		slog.Error("error finding container for removal", "agentId", agentID, "error", err)
+	} else if c != nil {
+		_, err = t.client.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true})
+		if err != nil {
+			return fmt.Errorf("error removing container: %w", err)
+		}
+	}
+
+	hostAgentDir := filepath.Dir(types.GetHostWorkspacePath(agentID))
+	slog.Debug("cleaning up local host directory", "path", hostAgentDir)
+	err = os.RemoveAll(hostAgentDir)
+	if err != nil {
+		slog.Error("failed to remove local agent directory", "path", hostAgentDir, "error", err)
+	}
+
+	slog.Info("agent deleted successfully", "agentId", agentID)
 	return nil
 }
 

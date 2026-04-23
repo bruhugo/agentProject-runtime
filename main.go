@@ -29,6 +29,7 @@ func main() {
 
 	// MIDDLEWARE
 	v1.Use(errors.ErrorHandler())
+	v1.Use(handlers.AuthMiddleware())
 
 	// DEPENDENCIES
 	ctx := context.Background()
@@ -42,6 +43,7 @@ func main() {
 
 	v1.POST("/agents", agentHandler.CreateAgent)
 	v1.PUT("/agents/:agentId/stop", agentHandler.StopAgent)
+	v1.DELETE("/agents/:agentId", agentHandler.DeleteAgent)
 	v1.GET("/agents/:agentId/stats", agentHandler.GetAgentStats)
 
 	// makes the agent load config file from blobstorage

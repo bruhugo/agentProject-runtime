@@ -16,14 +16,14 @@ type AgentHandler struct {
 }
 
 func getAgentId(ctx *gin.Context) (string, error) {
-	agendId := ctx.Param("agentId")
-	if agendId == "" {
+	agentId := ctx.Param("agentId")
+	if agentId == "" || !types.IsSafeID(agentId) {
 		return "", &errors.HttpAgentError{
-			Message: "no agent id provided",
-			Err:     fmt.Errorf("no agent id provided"),
+			Message: "invalid or missing agent id provided",
+			Err:     fmt.Errorf("invalid or missing agent id provided"),
 		}
 	}
-	return agendId, nil
+	return agentId, nil
 }
 
 func NewAgentHanlder(dockerTemplate docker.DockerTemplate) *AgentHandler {
@@ -37,6 +37,11 @@ func (h *AgentHandler) CreateAgent(ctx *gin.Context) {
 	err := ctx.ShouldBindBodyWithJSON(&agent)
 	if err != nil {
 		ctx.Error(errors.NewBadRequestError("Error mapping body to json", err, &agent))
+		return
+	}
+
+	if !types.IsSafeID(agent.ID) || !types.IsSafeID(agent.UserID) {
+		ctx.Error(errors.NewBadRequestError("Invalid agent or user ID format", fmt.Errorf("agentID or userID contains unsafe characters"), &agent))
 		return
 	}
 
@@ -74,6 +79,28 @@ func (h *AgentHandler) StopAgent(ctx *gin.Context) {
 			Message: "Error stopping container",
 			Err:     err,
 			AgentID: agentID,
+		})
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+func (h *AgentHandler) DeleteAgent(ctx *gin.Context) {
+	agentID, err := getAgentId(ctx)
+	if err != nil {
+		ctx.Error(err)
+		return
+	}
+
+	slog.Info("received request to delete agent", "agentId", agentID)
+
+	err = h.dockerTemplate.DeleteAgent(ctx, agentID)
+	if err != nil {
+		ctx.Error(&errors.HttpAgentError{
+			Message: "Error deleting agent",
+			AgentID: agentID,
+			Err:     err,
 		})
 		return
 	}

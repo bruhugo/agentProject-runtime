@@ -83,7 +83,7 @@ func (dockerTemplate DockerTemplateImpl) streamVpsMetrics(ctx context.Context) e
 			if err != nil {
 				slog.Error("error getting stats from agent",
 					"error", err.Error())
-				// Continue anyway, maybe host metrics are still valuable
+				// just GO :)
 			}
 
 			vpsStats.Agents = stats
@@ -125,7 +125,9 @@ func (dockerTemplate DockerTemplateImpl) streamVpsMetrics(ctx context.Context) e
 
 func (t *DockerTemplateImpl) syncWorkspace(agent *types.Agent) {
 	slog.Info("starting workspace sync background task", "agentId", agent.ID)
+	t.agentContextMu.RLock()
 	ctx, ok := t.agentContext[agent.ID]
+	t.agentContextMu.RUnlock()
 	if !ok {
 		slog.Error("must define the agent context before sending logs",
 			"agentId", agent.ID,
@@ -148,7 +150,9 @@ func (t *DockerTemplateImpl) syncWorkspace(agent *types.Agent) {
 
 func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Container) {
 	slog.Info("starting log streaming background task", "agentId", agent.ID)
+	t.agentContextMu.RLock()
 	ctx, ok := t.agentContext[agent.ID]
+	t.agentContextMu.RUnlock()
 	if !ok {
 		slog.Error("must define the agent context before sending logs",
 			"agentId", agent.ID,
@@ -156,30 +160,33 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 		return
 	}
 
-	buffer := bytes.NewBuffer(make([]byte, BUFFER_SIZE))
-	logs, err := t.client.ContainerLogs(ctx.ctx, container.ID, client.ContainerLogsOptions{})
+	logs, err := t.client.ContainerLogs(ctx.ctx, container.ID, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+	})
 	if err != nil {
-		slog.Error("error opening logs", "agent", agent.ID, "user", agent.UserID)
+		slog.Error("error opening logs", "agent", agent.ID, "user", agent.UserID, "error", err.Error())
 		return
 	}
 	scanner := bufio.NewScanner(logs)
 
 	var mutex sync.Mutex
-	ticker := time.NewTicker(4 * time.Minute)
+	ticker := time.NewTicker(60 * time.Second)
 
+	buffer := bytes.NewBuffer(make([]byte, 0))
+	bufferRead := 0
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
 				mutex.Lock()
-				defer mutex.Unlock()
-
-				// empty logs
 				if len(buffer.Bytes()) == 0 {
+					mutex.Unlock()
 					continue
 				}
 
-				remotepath := filepath.Join(types.GetRemoteLogsPath(agent.ID), time.Now().Local().String())
+				remotepath := filepath.Join(types.GetRemoteLogsPath(agent.ID), time.Now().Local().String()+".log")
 				slog.Debug("uploading logs due to timeout", "agentId", agent.ID, "remotePath", remotepath)
 				err = t.blobstorage.UploadBuffer(ctx.ctx, buffer, remotepath)
 				if err != nil {
@@ -187,9 +194,12 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 						"agentId", agent.ID,
 						"userId", agent.UserID,
 						"error", err.Error())
+					mutex.Unlock()
 					continue
 				}
 				buffer.Reset()
+				bufferRead = 0
+				mutex.Unlock()
 			case <-ctx.ctx.Done():
 				slog.Info("stopping log streaming background task (timer)", "agentId", agent.ID)
 				return
@@ -199,10 +209,9 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 
 	for scanner.Scan() {
 		mutex.Lock()
-		defer mutex.Unlock()
 
-		if len(scanner.Bytes())+buffer.Len() >= BUFFER_SIZE {
-			remotepath := filepath.Join(types.GetRemoteLogsPath(agent.ID), time.Now().Local().String())
+		if bufferRead+len(scanner.Bytes()) >= BUFFER_SIZE {
+			remotepath := filepath.Join(types.GetRemoteLogsPath(agent.ID), time.Now().Local().String()+".log")
 			slog.Debug("uploading logs due to buffer full", "agentId", agent.ID, "remotePath", remotepath)
 			err = t.blobstorage.UploadBuffer(ctx.ctx, buffer, remotepath)
 			if err != nil {
@@ -210,16 +219,30 @@ func (t *DockerTemplateImpl) sendLogs(agent *types.Agent, container *types.Conta
 					"agentId", agent.ID,
 					"userId", agent.UserID,
 					"error", err.Error())
+				mutex.Unlock()
 				continue
 			}
 			slog.Info("logs uploaded successfully",
 				"agentId", agent.ID,
 				"userId", agent.UserID)
 			buffer.Reset()
+			bufferRead = 0
 		}
 
-		buffer.Write(scanner.Bytes())
-		buffer.WriteByte('\n')
+		written, err := buffer.Write(scanner.Bytes())
+		if err != nil {
+			slog.Error("error writing to log buffer", "agentId", agent.ID, "userId", agent.UserID, "error", err.Error())
+			continue
+		}
+
+		err = buffer.WriteByte('\n')
+		if err != nil {
+			slog.Error("error writing to log buffer", "agentId", agent.ID, "userId", agent.UserID, "error", err.Error())
+			continue
+		}
+
+		bufferRead += written + 1
+		mutex.Unlock()
 	}
 	slog.Info("stopping log streaming background task (scanner finished)", "agentId", agent.ID)
 }

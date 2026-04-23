@@ -19,6 +19,7 @@ type Config struct {
 	PicoclawImage string `env:"PICOCLAW_IMAGE" json:"picoclaw_image"`
 
 	SystemUser string `env:"USER"`
+	ServerUser string `env:"SERVER_USER"`
 	LogLevel   string `env:"LOG_LEVEL"`
 }
 
